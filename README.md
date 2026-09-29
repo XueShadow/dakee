@@ -20,13 +20,15 @@ The selected dataset is the [MovieLens latest-small dataset](data/ml-latest-smal
 ```text
 AI MovieLens/
 ├── data/ml-latest-small/       # MovieLens dataset
-├── backend/app/                # API, providers, schemas, and services
-├── backend/tests/              # API tests
-├── streamlit_app.py            # Interactive Streamlit interface
+├── backend/app/                # Optional FastAPI API surface
+├── backend/tests/              # API regression tests
+├── streamlit_app.py            # Complete single-file Streamlit application
 ├── requirements.txt            # Python dependencies
 ├── .env.example                # Environment variable template
 └── README.md
 ```
+
+The deployed Streamlit application is intentionally self-contained in `streamlit_app.py`. It includes the interface, MovieLens loading and cleaning, text extraction, validation, local fallback analysis, Hugging Face integration, and result formatting in one file.
 
 ## 3. Environment Setup
 

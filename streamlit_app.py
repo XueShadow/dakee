@@ -1,20 +1,178 @@
 import html
 import io
+import json
 import os
+import re
 import tempfile
 import zipfile
+from abc import ABC, abstractmethod
 from pathlib import Path
-from urllib.request import urlopen
+from typing import Any, Dict, Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
-
-from backend.app.services.analysis_service import AnalysisService
-from backend.app.services.text_extraction import extract_text, validate_file
-from backend.app.providers.base import HuggingFaceProvider, LocalProvider
+from docx import Document
+from pydantic import BaseModel, Field, ValidationError, validator
+from pypdf import PdfReader
 
 load_dotenv(Path(__file__).parent / '.env')
+
+
+MAX_INPUT_LENGTH = 15000
+MAX_FILE_SIZE = 5 * 1024 * 1024
+ALLOWED_EXTENSIONS = {'.txt', '.pdf', '.docx'}
+
+
+class AnalysisRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+
+    @validator('text')
+    def validate_text(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError('Please provide movie text before starting the analysis.')
+        if len(cleaned) > MAX_INPUT_LENGTH:
+            raise ValueError('The input is too long. Please provide a shorter excerpt.')
+        return cleaned
+
+
+class AnalysisResult(BaseModel):
+    summary: str
+    themes: list[Dict[str, Any]]
+    characters: list[Dict[str, Any]]
+    relationships: list[Dict[str, Any]]
+    conflicts: list[Dict[str, Any]]
+    emotions: list[Dict[str, Any]]
+    important_scenes: list[Dict[str, Any]]
+    relational_dialectics: list[Dict[str, Any]]
+    insights: list[Dict[str, Any]]
+
+
+class AIProvider(ABC):
+    @abstractmethod
+    def analyze_text(self, text: str) -> Dict[str, Any]:
+        raise NotImplementedError
+
+
+class LocalProvider(AIProvider):
+    def analyze_text(self, text: str) -> Dict[str, Any]:
+        cleaned = AnalysisRequest(text=text).text
+        normalized = cleaned.lower()
+        theme_keywords = {
+            'Family': ['family', 'mother', 'sister', 'brother', 'home', 'wedding'],
+            'Conflict': ['conflict', 'argue', 'tension', 'resentment', 'dispute', 'fight'],
+            'Forgiveness': ['forgive', 'forgiveness', 'apology', 'repair', 'acceptance'],
+            'Communication': ['talk', 'tell', 'say', 'explain', 'listen', 'conversation'],
+            'Sacrifice': ['sacrifice', 'responsibility', 'support', 'care', 'giving up'],
+            'Love': ['love', 'care', 'devotion', 'affection', 'bond'],
+        }
+        matched_themes = [name for name, keywords in theme_keywords.items() if any(keyword in normalized for keyword in keywords)]
+        if not matched_themes:
+            matched_themes = ['General Narrative']
+
+        title_match = re.search(r'^Movie title:\s*(.+)$', cleaned, re.IGNORECASE | re.MULTILINE)
+        genres_match = re.search(r'^Genres:\s*(.+)$', cleaned, re.IGNORECASE | re.MULTILINE)
+        movie_title = title_match.group(1).strip() if title_match else ''
+        genres = genres_match.group(1).strip().replace('|', ', ') if genres_match else ''
+        names = re.findall(r'\b[A-Z][a-z]+\b', cleaned)
+        names = [name for name in names if name not in {'The', 'This', 'That', 'Movie', 'Film'}]
+        focal_character = movie_title or (names[0] if names else 'Narrative subject')
+        secondary_character = 'Community audience' if names else 'Reader'
+
+        themes = []
+        for name in matched_themes:
+            label = 'a broader narrative arc' if name == 'General Narrative' else name.lower()
+            themes.append({
+                'name': name,
+                'description': f'The text foregrounds {label} through recurring language and relational cues.',
+                'evidence': f'The supplied text contains wording associated with {label}.',
+                'characters': [focal_character, secondary_character],
+                'interpretation': 'This local reading is grounded in the supplied text rather than external facts.',
+            })
+
+        metadata = f' for {movie_title}' if movie_title else ''
+        genre_context = f' The listed genres are {genres}.' if genres else ''
+        summary = (
+            f'The local evidence-based analysis identifies {", ".join(matched_themes[:3])} as the clearest narrative signals{metadata}.'
+            f'{genre_context} The interpretation is grounded in the wording and emotional cues explicitly present in the supplied text.'
+        )
+        return {
+            'summary': summary,
+            'themes': themes,
+            'characters': [{'name': focal_character, 'role': 'Primary narrative focus', 'traits': ['text-driven'], 'motivation': 'To respond to the story pressure in the source text.', 'conflicts': ['narrative tension'], 'relationships': [secondary_character], 'development': 'The character focus emerges from the supplied evidence.'}],
+            'relationships': [{'character_a': focal_character, 'relationship': 'Narrative relationship', 'character_b': secondary_character, 'type': 'Textual', 'initial_state': 'observed', 'source_of_tension': 'the interpretive gap between text and audience understanding', 'important_event': 'The narrative cues become clearer during analysis.', 'development': 'Emotional cues and themes combine into a more precise reading.', 'current_state': 'active and interpretive'}],
+            'conflicts': [{'type': 'Textual conflict', 'participants': [focal_character, secondary_character], 'cause': 'The text creates tension between explicit details and implied meaning.', 'evidence': 'Evidence comes directly from the supplied language.', 'emotional_impact': 'The analysis highlights pressure and ambiguity.', 'resolution': 'The interpretation remains grounded in the source text.'}],
+            'emotions': [{'character': focal_character, 'emotion': 'uncertainty' if 'uncertain' in normalized else 'engagement', 'evidence': 'The emotional tone is inferred from the supplied wording.', 'confidence': 0.8}],
+            'important_scenes': [{'scene': 'Source text overview', 'characters': [focal_character, secondary_character], 'event': 'The text is evaluated for recurring themes and emotional pressure.', 'themes': matched_themes[:3], 'conflict': 'Tension emerges between explicit detail and underlying meaning.', 'emotion': 'engagement', 'meaning': 'The source is organized into an evidence-based narrative reading.', 'evidence': 'Evidence comes directly from the supplied language.'}],
+            'relational_dialectics': [{'tension': 'Evidence vs. interpretation', 'characters_involved': [focal_character, secondary_character], 'evidence': 'The text provides explicit statements while analysis infers meaning.', 'explanation': 'The reading balances direct wording and interpretation.', 'development': 'Clearer cues produce a richer reading.', 'resolution_or_continuing_tension': 'Interpretation remains grounded in evidence.'}],
+            'insights': [{'title': 'The text carries a clear narrative signal', 'text': 'Wording, emotional emphasis, and relationship cues support a coherent reading.', 'evidence': 'The insight is based on recurring patterns in the supplied text.'}],
+        }
+
+
+class HuggingFaceProvider(AIProvider):
+    def __init__(self, api_key: str, model: str = 'meta-llama/Llama-3.1-8B-Instruct'):
+        self.api_key = api_key.strip()
+        self.model = model.strip() or 'meta-llama/Llama-3.1-8B-Instruct'
+
+    def analyze_text(self, text: str) -> Dict[str, Any]:
+        validated_text = AnalysisRequest(text=text).text
+        schema = {'summary': 'string', 'themes': [{'name': 'string', 'description': 'string', 'evidence': 'string', 'characters': ['string'], 'interpretation': 'string'}], 'characters': [], 'relationships': [], 'conflicts': [], 'emotions': [], 'important_scenes': [], 'relational_dialectics': [], 'insights': []}
+        prompt = ('Analyze the supplied movie text for themes, characters, relationships, conflicts, emotions, important scenes, relational dialectics, and evidence-based insights. Return only valid JSON matching this schema. Do not invent facts.\n\n' f'Schema:\n{json.dumps(schema)}\n\nMovie text:\n{validated_text}')
+        payload = json.dumps({'model': self.model, 'messages': [{'role': 'system', 'content': 'You are an academic film narrative analyst. Return JSON only.'}, {'role': 'user', 'content': prompt}], 'temperature': 0.2, 'max_tokens': 4000}).encode('utf-8')
+        request = Request('https://router.huggingface.co/v1/chat/completions', data=payload, headers={'Authorization': f'Bearer {self.api_key}', 'Content-Type': 'application/json'}, method='POST')
+        try:
+            with urlopen(request, timeout=90) as response:
+                response_data = json.loads(response.read().decode('utf-8'))
+        except HTTPError as exc:
+            response_body = exc.read().decode('utf-8', errors='replace')
+            try:
+                detail = json.loads(response_body).get('error', {}).get('message')
+            except (TypeError, ValueError):
+                detail = None
+            raise ValueError(f'Hugging Face request failed: {detail or exc.reason}. Check your API key or model.') from exc
+        except URLError as exc:
+            raise ValueError(f'Hugging Face request failed: {exc.reason}. Check your API key or model.') from exc
+        content = response_data['choices'][0]['message']['content']
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if not json_match:
+            raise ValueError('Hugging Face returned an invalid analysis response.')
+        return json.loads(json_match.group(0))
+
+
+class AnalysisService:
+    def __init__(self, provider: AIProvider):
+        self.provider = provider
+
+    def analyze_text(self, text: str) -> Dict[str, Any]:
+        return AnalysisResult(**self.provider.analyze_text(text)).dict()
+
+
+def extract_text(file_path: str) -> str:
+    suffix = Path(file_path).suffix.lower()
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise ValueError('Unsupported file type. Please upload a .txt, .pdf, or .docx file.')
+    if suffix == '.txt':
+        return Path(file_path).read_text(encoding='utf-8', errors='ignore')
+    if suffix == '.pdf':
+        return '\n'.join(page.extract_text() or '' for page in PdfReader(file_path).pages).strip()
+    if suffix == '.docx':
+        return '\n'.join(paragraph.text for paragraph in Document(file_path).paragraphs).strip()
+    raise ValueError('Unable to extract text from the uploaded file.')
+
+
+def validate_file(file_name: Optional[str], file_size: Optional[int]) -> None:
+    if not file_name:
+        raise ValueError('No file was provided.')
+    if Path(file_name).suffix.lower() not in ALLOWED_EXTENSIONS:
+        raise ValueError('Unsupported file type. Please upload a .txt, .pdf, or .docx file.')
+    if file_size is None or file_size <= 0:
+        raise ValueError('The uploaded file is empty.')
+    if file_size > MAX_FILE_SIZE:
+        raise ValueError('The uploaded file exceeds the 5 MB limit.')
+
 
 MOVIELENS_DATA_URL = os.getenv(
     'MOVIELENS_DATA_URL',
